@@ -12,6 +12,7 @@ logs/
 idea/*
 .idea
 *.iml
+.DS_Store
 
 # Prevent the CTF file from being exposed to git, or making git complain
 ctf
@@ -20,6 +21,7 @@ ctf
 keys/
 id_rsa*
 .ssh/
+certs/
 
 # The environment doesn't need to be exposed to Git, either
 .env

@@ -5,6 +5,7 @@ Modified by KazWolfe for HuskyBot, and likely botched beyond belief.
 """
 
 import itertools
+import re
 
 import discord
 from discord.ext.commands import DefaultHelpCommand, Paginator
@@ -21,6 +22,22 @@ class HuskyHelpFormatter(DefaultHelpCommand):
         self.commands_heading = "Commands\n--------"
 
         super().__init__(paginator=self.paginator, commands_heading=self.commands_heading, **options)
+
+    def preprocess_helpdoc(self, doc) -> str:
+        """
+        Formatting preprocessor to handle ugly helpdocs.
+
+        This method will "intelligently" strip newlines from helpdocs, based on a couple rules:
+
+        - Newlines with a preceding newline are *not* stripped
+        - Newlines with a following newline, one or more following dashes, or one or more whitespaces.
+
+        This isn't perfect, but it generally will clean up most of the bot's helpdocs and make them cleaner.
+        """
+
+        regex = r"(?<![\r\n])(\r?\n|\r)(?![\r\n]|\-+|\s+)"
+
+        return re.sub(regex, ' ', doc)
 
     def get_command_signature(self, command):
         parent = command.full_parent_name
@@ -93,15 +110,26 @@ class HuskyHelpFormatter(DefaultHelpCommand):
             The command to format.
         """
 
-        if command.description:
-            self.paginator.add_line(command.description, empty=True)
-
-        signature = self.get_command_signature(command)
-        self.paginator.add_line(signature, empty=True)
+        # ToDo: Codesmell, this overrides `help` for the command. Not the best, but relatively safe.
 
         if command.help:
-            for line in command.help.splitlines():
+            pretty_helpdoc = self.preprocess_helpdoc(command.help)
+            lines = []
+
+            for line in pretty_helpdoc.splitlines():
                 if "<!nodoc>" in line:
                     continue
-                self.paginator.add_line(line)
-            self.paginator.add_line()
+
+                lines.append(line)
+
+            command.help = "\n".join(lines)
+
+        super().add_command_formatting(command)
+
+    async def send_cog_help(self, cog):
+        # ToDo: Codesmell, this overrides `__cog_cleaned_doc` for the cog. Not the best, but relatively safe.
+
+        if cog.description:
+            cog.__cog_cleaned_doc__ = self.preprocess_helpdoc(cog.description)
+
+        await super().send_cog_help(cog)

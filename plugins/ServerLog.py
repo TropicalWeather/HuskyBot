@@ -90,6 +90,7 @@ class ServerLog(commands.Cog):
         alert_channel = self._config.get('specialChannels', {}).get(ChannelKeys.USER_LOG.value, None)
 
         if alert_channel is None:
+            LOG.debug("skipping log event - no userlog channel set.")
             return
 
         alert_channel = member.guild.get_channel(alert_channel)
@@ -97,12 +98,22 @@ class ServerLog(commands.Cog):
         embed = discord.Embed(
             title=Emojis.DOOR + " Member left the guild",
             description=f"{member} has left the guild.",
-            color=Colors.PRIMARY
+            color=Colors.WARNING
         )
 
         embed.set_thumbnail(url=member.avatar_url)
         embed.add_field(name="User ID", value=member.id)
         embed.add_field(name="Leave Timestamp", value=HuskyUtils.get_timestamp())
+
+        roles_on_leave = []
+        for role in member.roles:  # type: discord.Role
+            if role.is_default():
+                continue
+
+            roles_on_leave.append(role.mention)
+
+        if roles_on_leave:
+            embed.add_field(name="Roles on Leave", value=", ".join(roles_on_leave), inline=False)
 
         LOG.info(f"User {member} has left {member.guild.name}.")
         await alert_channel.send(embed=embed)
@@ -265,9 +276,16 @@ class ServerLog(commands.Cog):
         embed.add_field(name="Channel", value=message.channel.mention, inline=True)
         embed.add_field(name="Send Timestamp", value=message.created_at.strftime(DATETIME_FORMAT), inline=True)
         embed.add_field(name="Delete Timestamp", value=HuskyUtils.get_timestamp(), inline=True)
+        if len(message.embeds):
+            embed.add_field(name="Embed Count", value=f"{len(message.embeds)}", inline=True)
+        if message.type != discord.MessageType.default:
+            embed.add_field(name="Message Type", value=f"`{message.type}`", inline=True)
+        if message.is_system():
+            embed.add_field(name="System Message", value="True", inline=True)
 
         if message.content is not None and message.content != "":
-            embed.add_field(name="Message", value=HuskyUtils.trim_string(message.content, 1000, True), inline=False)
+            embed.add_field(name="Message", value=HuskyUtils.trim_string(message.clean_content, 1000, True),
+                            inline=False)
 
         if message.attachments is not None and len(message.attachments) > 1:
             attachments_list = str(f"- {a.url}\n" for a in message.attachments)

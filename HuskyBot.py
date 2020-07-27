@@ -4,13 +4,14 @@ import datetime
 # System imports
 import logging
 import os
-import signal
 import ssl
 import sys
 import traceback
+from typing import *
 
 # discord.py imports
 import discord
+import discord.http
 from discord.ext import commands
 
 # Database imports
@@ -55,7 +56,7 @@ class HuskyBot(commands.Bot, metaclass=HuskyUtils.Singleton):
 
         # Database things
         # noinspection PyTypeChecker
-        self.db = None  # type: sqlalchemy.engine.Engine
+        self.db: Optional[sqlalchemy.engine.Engine] = None
         self.session_factory = None
 
         # Load in HuskyBot's logger
@@ -63,6 +64,9 @@ class HuskyBot(commands.Bot, metaclass=HuskyUtils.Singleton):
 
         # Load in HuskyBot's API
         self.webapp = web.Application()
+
+        # Allow setting custom routes (litecord/canary/apiv7 support)
+        discord.http.Route.BASE = os.getenv('DISCORD_API_URL', discord.http.Route.BASE)
 
         super().__init__(
             command_prefix=self.config.get('prefix', '/'),
@@ -76,28 +80,15 @@ class HuskyBot(commands.Bot, metaclass=HuskyUtils.Singleton):
         self.init_stage = 0
 
     def entrypoint(self):
-        # Prepare signal handler
-        signal.signal(signal.SIGTERM, self.shutdown)
-        signal.signal(signal.SIGINT, self.shutdown)
-
         if os.environ.get('DISCORD_TOKEN'):
-            LOG.info("Loading API key from environment variable DISCORD_TOKEN.")
-        elif self.config.get('apiKey') is None:
-            if HuskyUtils.is_docker():
-                LOG.critical("Please specify the API key by using the DISCORD_TOKEN environment varaible when using "
-                             "Docker.")
-                exit(1)
-
-            if self.__daemon_mode:
-                LOG.critical("The bot does not have an API key assigned to it. Please either specify a key in the env "
-                             "variable DISCORD_TOKEN, add a key to the config, or run this bot in non-daemon mode.")
-                exit(1)
-            else:
-                print("The bot does not have an API key defined. Please enter one below...")
-                key = input("Discord API Key? ")
-
-                self.config.set('apiKey', key)
-                print("The API key has been set!")
+            LOG.debug("Loading API key from environment variable DISCORD_TOKEN.")
+        elif self.config.get('apiKey'):
+            LOG.warning("DEPRECATION WARNING - The Discord API key is being retrieved from the config file. "
+                        "This capability will be removed in a future release. Please move the token to the "
+                        "DISCORD_TOKEN environment variable.")
+        else:
+            LOG.critical("The API key for HuskyBot must be loaded via the DISCORD_TOKEN environment variable.")
+            exit(1)
 
         LOG.info("The bot's log path is: {}".format(self.__log_path))
 
@@ -113,32 +104,34 @@ class HuskyBot(commands.Bot, metaclass=HuskyUtils.Singleton):
             LOG.info("The bot is running in DEVELOPER MODE! Some features may behave in unexpected ways or may "
                      "otherwise break. Some bot safety checks are disabled with this mode on.")
 
-        self.run(os.environ.get('DISCORD_TOKEN') or self.config['apiKey'])
+        self.run(os.getenv('DISCORD_TOKEN', self.config.get('apiKey')))
 
-        if self.config.get("restartReason") is not None:
-            print("READY FOR RESTART!")
-            os.execl(sys.executable, *([sys.executable] + sys.argv))
-
-    def shutdown(self):
-        LOG.info("Shutting down HuskyBot...")
         LOG.info("Shutting down HuskyBot...")
 
         self.config.save()
         LOG.debug("Config file saved/written to disk.")
 
-        self.db.dispose()
-        LOG.debug("DB shut down")
+        if self.db:
+            self.db.dispose()
+            LOG.debug("DB connection shut down")
 
-        self.loop.create_task(self.logout())
+        if self.config.get("restartReason") is not None:
+            LOG.info("Bot is ready for restart...")
+            os.execl(sys.executable, *([sys.executable] + sys.argv))
+
+    async def logout(self):
+        LOG.info("Shutting down HuskyBot...")
+
+        await super().logout()
 
     def __check_developer_mode(self):
-        return bool(os.environ.get('HUSKYBOT_DEVMODE', False)) or self.config.get('developerMode', False)
+        return bool(os.environ.get('HUSKYBOT_DEVMODE', self.config.get('developerMode', False)))
 
     def __build_stage0_activity(self):
         mapping = {
             "admin": "Restarting...",
             "update": "Updating...",
-            None: "Starting"
+            None: "Starting..."
         }
 
         restart_reason = self.config.get("restartReason")
@@ -164,6 +157,7 @@ class HuskyBot(commands.Bot, metaclass=HuskyUtils.Singleton):
         if self.__daemon_mode:
             stream_log_handler.setFormatter(logging.Formatter("[%(levelname)s] %(name)s: %(message)s"))
 
+        # noinspection PyArgumentList
         logging.basicConfig(
             level=logging.WARNING,
             format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -181,17 +175,21 @@ class HuskyBot(commands.Bot, metaclass=HuskyUtils.Singleton):
         return bot_logger
 
     async def __init_guild_lock(self):
-        if self.config.get('guildId') is not None:
+        locked_guild = self.config.get('guildId')
+
+        if locked_guild:
             for guild in self.guilds:  # type: discord.Guild
-                if guild.id != self.config.get('guildId'):
+                if guild.id != locked_guild:
                     LOG.warning(f"Bot was in unauthorized guild {guild.name} ({guild.id}). "
                                 f"Leaving the guild.")
                     await guild.leave()
-
-        elif len(self.guilds) > 0:
-            LOG.critical("Bot account is in multiple guilds without being in developer mode or "
-                         "having a guild set. Please remove this account from all guilds, or specify "
-                         "a guild ID in the config.")
+        elif len(self.guilds) == 1:
+            LOG.info(f"The bot did not have a guild locked, but was a member of one. Locking the bot to guild ID "
+                     f"{self.guilds[0].id}.")
+            self.config.set('guildId', self.guilds[0].id)
+        elif len(self.guilds) > 1:
+            LOG.critical("The bot is in multiple guilds without being locked to a guild. Please remove the bot from "
+                         "extra guilds, or specify a guildId in the configuration.")
             exit(127)
         else:
             LOG.info("The bot is not associated with any guilds yet. The next guild joined by the bot will be locked.")
@@ -210,6 +208,7 @@ class HuskyBot(commands.Bot, metaclass=HuskyUtils.Singleton):
                 ssl_context.load_cert_chain(cert.read())
 
         for method in ["GET", "HEAD", "POST", "PATCH", "PUT", "DELETE", "VIEW"]:
+            # Abuse the hell out of aiohttp's own router to load in HuskyRouter.
             self.webapp.router.add_route(method, '/{tail:.*}', HuskyHTTP.get_router().handle(self))
 
         runner = web.AppRunner(self.webapp)
@@ -266,27 +265,57 @@ class HuskyBot(commands.Bot, metaclass=HuskyUtils.Singleton):
             ))
             self.config.delete("restartNotificationChannel")
 
+    async def __get_superusers(self, app_info: discord.AppInfo = None) -> []:
+        su_list = self.config.get('superusers', [])
+
+        if not app_info:
+            app_info: discord.AppInfo = await self.application_info()
+
+        if app_info.team:
+            for team_member in app_info.team.members:
+                if team_member.membership_state == discord.TeamMembershipState.accepted and not team_member.bot:
+                    su_list.append(team_member.id)
+        else:
+            su_list.append(app_info.owner.id)
+
+        return list(set(su_list))
+
+    # noinspection PyBroadException
+    async def init(self):
+        if self.init_stage != 0:
+            LOG.warning("The bot attempted to re-run initialization. Did the network or similar die?")
+            return
+
+        try:
+            await self.init_stage1()
+            await self.init_stage2()
+        except Exception as e:
+            try:
+                await self.init_recovery()
+            except Exception:
+                LOG.critical("Failed to launch recovery mode, flailing...")
+                exit(127)  # just crash at this point, something is very very bad.
+            raise e
+
     async def init_stage1(self):
         """
         Initialize the bot logger and other critical services. Init stage 1 will *not* re-run if it has executed.
         """
-
-        if self.init_stage >= 1:
-            LOG.warning("The system attempted to re-run initialization stage 1. Did the network or "
-                        "similar die?")
-            return
 
         # Load in application information
         app_info = await self.application_info()
         self.session_store.set("appInfo", app_info)
 
         # Load in superusers
-        self.superusers: list = self.config.get('superusers', []) + [app_info.owner.id]
+        self.superusers = await self.__get_superusers(app_info)
         LOG.info(f"Superusers loaded: {self.superusers}")
 
         LOG.info(f"HuskyBot is online, running discord.py {discord.__version__}. Initializing and "
                  f"loading modules...")
 
+        self.init_stage = 1
+
+    async def init_stage2(self):
         if not self.developer_mode:
             await self.__init_guild_lock()
 
@@ -296,13 +325,30 @@ class HuskyBot(commands.Bot, metaclass=HuskyUtils.Singleton):
 
         await self.__init_inform_restart()
 
-        self.init_stage = 1
         self.session_store.set('initTime', datetime.datetime.now())
         LOG.info("The bot has been initialized. Ready to process commands and events.")
 
+        self.init_stage = 2
+
+    async def init_recovery(self):
+        LOG.critical("The bot has loaded into recovery mode due to an unrecoverable initialization failure.")
+        sys.path.insert(2, os.getcwd() + "/plugins/")
+
+        recovery_plugins = ['Base', 'BotAdmin', 'Debug']
+
+        for plugin in recovery_plugins:
+            LOG.info(f"Loaded recovery mode plugin {plugin}")
+            self.load_extension(plugin)
+
+        await self.change_presence(
+            activity=discord.Activity(name="< RECOVERY MODE >", type=discord.ActivityType.playing),
+            status=discord.Status.dnd
+        )
+
+        self.init_stage = -127
+
     async def on_ready(self):
-        # Attempt to initialize the bot
-        await self.init_stage1()
+        await self.init()
 
         ready_presence = self.config.get('presence', {"game": "HuskyBot", "type": 2, "status": "dnd"})
 
@@ -416,7 +462,7 @@ class HuskyBot(commands.Bot, metaclass=HuskyUtils.Singleton):
             if self.developer_mode:
                 embed = discord.Embed(
                     title="Command Handler",
-                    description=f"**The command `{p}{command_name}` does not exist.** See `{p}help` for valid "
+                    description=f"**The command `{p}{command_name}` is disabled.** See `{p}help` for valid "
                                 f"commands.",
                     color=Colors.DANGER
                 )
@@ -442,8 +488,7 @@ class HuskyBot(commands.Bot, metaclass=HuskyUtils.Singleton):
             await ctx.send(embed=discord.Embed(
                 title="Command Handler",
                 description=f"**The command `{p}{command_name}` failed an execution check.** Additional information "
-                            f"may "
-                            f"be provided below.",
+                            f"may be provided below.",
                 color=Colors.DANGER
             ).add_field(name="Error Log", value="```" + error_string + "```", inline=False))
 
@@ -504,8 +549,8 @@ class HuskyBot(commands.Bot, metaclass=HuskyUtils.Singleton):
 
             await ctx.send(embed=discord.Embed(
                 title="Command Handler",
-                description=f"**The command `{p}{command_name}` has been run too much recently!**\nPlease wait "
-                            f"**{tx}** until trying again.",
+                description=f"**The command `{p}{command_name}` has been run too much recently!**\n"
+                            f"Please wait **{tx}** until trying again.",
                 color=Colors.DANGER
             ))
 
@@ -523,6 +568,7 @@ class HuskyBot(commands.Bot, metaclass=HuskyUtils.Singleton):
                       ctx.message.content,
                       ''.join(traceback.format_exception(type(error), error, error.__traceback__)))
 
+            # ToDo: Clean this up a bit more so these commands don't have hardcoded exemptions.
             if command_name.lower() in ["eval", "feval", "requestify"]:
                 LOG.info(f"Suppressed critical error reporting for command {command_name}")
                 return
@@ -532,6 +578,12 @@ class HuskyBot(commands.Bot, metaclass=HuskyUtils.Singleton):
 
 
 if __name__ == '__main__':
+    if os.name != "posix":
+        # Critical logging isn't the best way to do this, as this is (technically) before the logger is initialized,
+        # but it's still somewhat there. We just haven't hooked in our fancy features yet.
+        LOG.critical("This application may only run on POSIX-compliant operating systems such as Linux or macOS.")
+        exit(1)
+
     bot = HuskyBot()
     bot.entrypoint()
     LOG.info("Left entrypoint, bot has shut down. Goodbye, everybody!")

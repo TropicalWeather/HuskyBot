@@ -10,7 +10,7 @@ services:
     environment:
     - HUSKYBOT_PLATFORM=compose
     ports:
-    - "9339"
+      - "9339:9339"
     networks:
     - resources
     volumes:
@@ -20,8 +20,8 @@ services:
     restart: on-failure
   db:
     image: postgres
-    ports:
-    - "5432:5432"
+    expose:
+      - "5432"
     environment:
       POSTGRES_USER: "huskybot"
     env_file: .env
